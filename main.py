@@ -1,32 +1,13 @@
-import re
+#!/usr/bin/env python3
 import argparse
 from xml.etree.ElementTree import Element, tostring
 
-# ==========================================
-# ПРЕТТИ-ПРИНТ XML (ТАБУЛЯЦИЯ)
-# ==========================================
-
-def indent(elem, level=0):
-    """
-    Рекурсивно вставляет табуляцию в ElementTree.
-    """
-    i = "\n" + "\t" * level
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = i + "\t"
-        for child in elem:
-            indent(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = i
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = i
+from lark import Lark, Transformer
 
 
-# ==========================================
-# УДАЛЕНИЕ КОММЕНТАРИЕВ
-# ==========================================
-
+# ----------------------
+# Убираем комментарии
+# ----------------------
 def remove_comments(text: str) -> str:
     out = []
     i = 0
@@ -46,7 +27,7 @@ def remove_comments(text: str) -> str:
             i += 1
             continue
 
-        if text.startswith("NB.", i):
+        if text.startswith("NB.", i) or text.startswith("//", i):
             while i < n and text[i] not in "\r\n":
                 i += 1
             continue
@@ -56,240 +37,211 @@ def remove_comments(text: str) -> str:
 
     if in_multi:
         raise SyntaxError("Unclosed multi-line comment")
-
     return "".join(out)
 
 
-# ==========================================
-# ЛЕКСЕР
-# ==========================================
+# ----------------------
+# Грамматика
+# ----------------------
+GRAMMAR = r"""
+start: stmt*
 
-TOKEN_PATTERNS = [
-    ("CONST_READ", r"\.\([a-zA-Z][_a-zA-Z0-9]*\)\."),
-    ("DEFINE", r"\(define\b"),
-    ("NUMBER", r"0[oO][0-7]+"),
-    ("STRING", r'@"(?:\\.|[^"\\])*"'),
-    ("LBRACK", r"\["),
-    ("RBRACK", r"\]"),
-    ("SEMICOL", r";"),
-    ("ENDPAREN", r"\)"),
-    ("IDENT", r"[a-zA-Z][_a-zA-Z0-9]*"),
-    ("SKIP", r"[ \t\r\n]+"),
-]
+stmt: define
+    | assign
+    | value_stmt
 
-TOKEN_REGEX = [(name, re.compile("^" + pat)) for name, pat in TOKEN_PATTERNS]
+define: "(" "define" NAME value ")"
+assign: NAME "=" value ";"?
 
+value_stmt: value ";"*
 
-class Lexer:
-    def __init__(self, text):
-        self.text = remove_comments(text)
-        self.pos = 0
-        self.n = len(self.text)
-        self.tokens = []
+?value: const_read
+      | NUMBER
+      | STRING
+      | NAME
+      | array
 
-    def tokenize(self):
-        while self.pos < self.n:
-            part = self.text[self.pos:]
-            matched = False
+const_read: "." "(" NAME ")" "."
+array: "[" [value (";" value)* ";"?] "]"
 
-            for name, cre in TOKEN_REGEX:
-                m = cre.match(part)
-                if m:
-                    value = m.group(0)
+// --- ИГНОРИРУЕМЫЕ СИМВОЛЫ ---
 
-                    if name == "SKIP":
-                        self.pos += len(value)
-                        matched = True
-                        break
+_WHITESPACE: /[\s\t\n\r\u00A0\uFEFF\u2000-\u200A\u202F\u205F\u3000]+/ 
+%ignore _WHITESPACE
 
-                    if name == "CONST_READ":
-                        self.tokens.append(("CONST_READ", value[2:-2]))
-                        self.pos += len(value)
-                        matched = True
-                        break
-
-                    self.tokens.append((name, value))
-                    self.pos += len(value)
-                    matched = True
-                    break
-
-            if matched:
-                continue
-
-            self.pos += 1
-
-        self.tokens.append(("EOF", ""))
-        return self.tokens
+GARBAGE: /[^\[\]\(\);=@\.\"A-Za-z0-9_\u0400-\u04FF\)]+/
+%ignore GARBAGE
 
 
-# ==========================================
-# ПАРСЕР
-# ==========================================
+NUMBER: /0[oO][0-7]+/
+STRING: /@\"(?:\\.|[^"\\])*\"/
+NAME: /[a-zA-Z][_a-zA-Z0-9]*/
 
-class Parser:
-    def __init__(self, tokens):
-        self.tokens = tokens
-        self.i = 0
-        self.constants = {}
-
-    def peek(self):
-        return self.tokens[self.i] if self.i < len(self.tokens) else ("EOF", "")
-
-    def next(self):
-        tok = self.peek()
-        self.i += 1
-        return tok
-
-    def expect(self, kind):
-        tok = self.peek()
-        if tok[0] != kind:
-            raise SyntaxError(f"Expected {kind}, got {tok}")
-        self.i += 1
-        return tok[1]
-
-    def parse_all(self):
-        out = []
-        while True:
-            kind, _ = self.peek()
-            if kind == "EOF":
-                break
-
-            if kind in ("SEMICOL", "ENDPAREN"):
-                self.next()
-                continue
-
-            if kind == "DEFINE":
-                out.append(self.parse_define())
-            else:
-                out.append(self.parse_value())
-
-        return out
-
-    def parse_define(self):
-        self.expect("DEFINE")
-        name = self.expect("IDENT")
-        value = self.parse_value()
-        self.expect("ENDPAREN")
-        self.constants[name] = value
-        return ("define", name, value)
-
-    def parse_value(self):
-        kind, val = self.peek()
-
-        if kind in ("SEMICOL", "ENDPAREN"):
-            self.next()
-            return self.parse_value()
-
-        if kind == "CONST_READ":
-            self.next()
-            return ("const", val)
-
-        if kind == "NUMBER":
-            self.next()
-            return ("number", int(val, 8))
-
-        if kind == "STRING":
-            self.next()
-            return ("string", val[2:-1])
-
-        if kind == "IDENT":
-            self.next()
-            return ("ident", val)
-
-        if kind == "LBRACK":
-            return self.parse_array()
-
-        raise SyntaxError(f"Unexpected token: {self.peek()}")
-
-    def parse_array(self):
-        self.expect("LBRACK")
-        arr = []
-        while self.peek()[0] != "RBRACK":
-            arr.append(self.parse_value())
-            if self.peek()[0] == "SEMICOL":
-                self.next()
-        self.expect("RBRACK")
-        return ("array", arr)
+"""
 
 
-# ==========================================
-# EVALUATOR
-# ==========================================
+# ----------------------
+# Transformer
+# ----------------------
+class ToAST(Transformer):
+    def NUMBER(self, tok):
+        return ("number", int(str(tok), 8))
 
+    def STRING(self, tok):
+        inner = str(tok)[2:-1]
+        try:
+            inner = bytes(inner, "utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+        return ("string", inner)
+
+    def NAME(self, tok):
+        return ("ident", str(tok))
+
+    def const_read(self, children):
+        return ("const", children[0][1])
+
+    def array(self, children):
+        return ("array", children)
+
+    def define(self, children):
+        if len(children) < 2:
+            raise SyntaxError("Invalid define: missing name or value")
+        name_node = children[0]
+        value_node = children[1]
+        return ("define", name_node[1], value_node)
+
+    def assign(self, children):
+        name_node = children[0]
+        value_node = children[1]
+        return ("assign", name_node[1], value_node)
+
+    def value_stmt(self, children):
+        return children[0]
+
+    def stmt(self, children):
+        return children[0]
+
+    def start(self, children):
+        return children
+
+
+# ----------------------
+# Evaluator
+# ----------------------
 class Evaluator:
-    def __init__(self, consts):
-        self.consts = consts
+    def __init__(self):
+        self.consts = {}
 
     def eval(self, node):
+        if node is None:
+            return None
         t = node[0]
-
-        if t == "number": return node[1]
-        if t == "string": return node[1]
-        if t == "ident": return node[1]
-        if t == "array": return [self.eval(x) for x in node[1]]
-
+        if t == "number":
+            return node[1]
+        if t == "string":
+            return node[1]
+        if t == "ident":
+            return node[1]
+        if t == "array":
+            return [self.eval(x) for x in node[1]]
         if t == "const":
             name = node[1]
             if name not in self.consts:
                 raise NameError(f"Unknown constant {name}")
             return self.eval(self.consts[name])
-
         return None
 
 
-# ==========================================
+# ----------------------
 # XML
-# ==========================================
-
+# ----------------------
 def xml_value(v):
     if isinstance(v, int):
-        e = Element("number"); e.text = str(v); return e
+        e = Element("number");
+        e.text = str(v);
+        return e
     if isinstance(v, str):
-        e = Element("string"); e.text = v; return e
+        e = Element("string");
+        e.text = v;
+        return e
     if isinstance(v, list):
         e = Element("array")
-        for x in v: e.append(xml_value(x))
+        for x in v:
+            e.append(xml_value(x))
         return e
-    e = Element("null"); return e
+    e = Element("null");
+    return e
+
+
+def indent(elem, level=0):
+    nl = "\n"
+    pad = "\t" * level
+    i = nl + pad
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "\t"
+        for child in elem:
+            indent(child, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
 
 
 def xml_out(values):
     root = Element("root")
     for v in values:
         item = Element("item")
-        item.append(xml_value(v))
+        if isinstance(v, tuple) and v[0] == "assign":
+            _, name, val = v
+            assign_el = Element("assign")
+            n_el = Element("name");
+            n_el.text = str(name)
+            assign_el.append(n_el)
+            assign_el.append(xml_value(val))
+            item.append(assign_el)
+        else:
+            item.append(xml_value(v))
         root.append(item)
-
-    # === вот тут вставляем табуляцию ===
-    indent(root, 0)
-
+    indent(root)
     return tostring(root, encoding="unicode")
 
 
-# ==========================================
+# ----------------------
 # MAIN
-# ==========================================
-
+# ----------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     args = ap.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
-        text = f.read()
+        text = remove_comments(f.read())
 
-    tokens = Lexer(text).tokenize()
-    parser = Parser(tokens)
-    ast = parser.parse_all()
+    parser = Lark(GRAMMAR, start="start", parser="lalr")
+    tree = parser.parse(text)
+    ast = ToAST().transform(tree)
 
-    evaluator = Evaluator(parser.constants)
-    values = []
+    evaluator = Evaluator()
+    out_list = []
 
     for node in ast:
-        if node[0] != "define":
-            values.append(evaluator.eval(node))
+        if not isinstance(node, tuple):
+            continue
+        if node[0] == "define":
+            _, name, val_node = node
+            evaluator.consts[name] = val_node
+            out_list.append(evaluator.eval(val_node))
+        elif node[0] == "assign":
+            _, name, val_node = node
+            val = evaluator.eval(val_node)
+            out_list.append(("assign", name, val))
+        else:
+            out_list.append(evaluator.eval(node))
 
-    print(xml_out(values))
+    print(xml_out(out_list))
 
 
 if __name__ == "__main__":
